@@ -6,9 +6,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-import aiosqlite
+import motor.motor_asyncio
 from fastapi import HTTPException
 
+import src.db as db_module
 from src.auth import (
     ForgotPasswordRequest,
     LoginRequest,
@@ -26,99 +27,60 @@ from src.auth import (
     signup,
     verify_email,
 )
-from src.db import get_threads, migrate_database_schema, save_thread
+from src.db import (
+    get_threads,
+    migrate_database_schema,
+    init_mongodb,
+    save_thread,
+    get_user_by_email,
+)
 
 
-async def setup_auth_db(path: Path) -> None:
-    async with aiosqlite.connect(path) as conn:
-        await conn.execute(
-            """
-            CREATE TABLE providers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                service_type TEXT,
-                location TEXT,
-                rating REAL,
-                base_price REAL,
-                available BOOLEAN
-            )
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE bookings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                provider_id INTEGER,
-                user_id TEXT,
-                booking_time TEXT,
-                status TEXT
-            )
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE threads (
-                thread_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                title TEXT NOT NULL DEFAULT 'New Conversation',
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL DEFAULT '',
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                is_verified INTEGER DEFAULT 0,
-                verification_token TEXT,
-                reset_token TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        await conn.execute(
-            """
-            CREATE TABLE token_blacklist (
-                token TEXT PRIMARY KEY,
-                expires_at TEXT NOT NULL
-            )
-            """
-        )
-        await conn.commit()
-
-
-async def get_user_row(email: str) -> dict:
-    async with aiosqlite.connect(os.environ["SERVICE_AGENT_DB"]) as conn:
-        conn.row_factory = aiosqlite.Row
-        cursor = await conn.execute("SELECT * FROM users WHERE email = ?", (email,))
-        row = await cursor.fetchone()
-        return dict(row)
+async def setup_mongo_test_db(uri: str, db_name: str) -> None:
+    """Initialize a fresh MongoDB test database and clear collections."""
+    init_mongodb(uri, db_name)
+    # Drop existing collections to ensure a clean slate
+    await db_module.db.client[db_name].drop_collection("users")
+    await db_module.db.client[db_name].drop_collection("providers")
+    await db_module.db.client[db_name].drop_collection("bookings")
+    await db_module.db.client[db_name].drop_collection("threads")
+    await db_module.db.client[db_name].drop_collection("token_blacklist")
+    await migrate_database_schema()
 
 
 class AuthTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.tmp.name) / "service_agent.db"
-        os.environ["SERVICE_AGENT_DB"] = str(self.db_path)
-        asyncio.run(setup_auth_db(self.db_path))
-        asyncio.run(migrate_database_schema())
+        self.mongo_uri = os.getenv("MONGODB_TEST_URI")
+        if not self.mongo_uri:
+            self.tmp.cleanup()
+            raise unittest.SkipTest("MONGODB_TEST_URI is not configured")
+        # Use a test MongoDB database name derived from the temp directory name
+        self.test_db_name = f"test_{Path(self.tmp.name).name}"
+        asyncio.run(setup_mongo_test_db(self.mongo_uri, self.test_db_name))
+        # Ensure the application uses the test DB by setting env vars used in config
+        os.environ["MONGODB_DB"] = self.test_db_name
+        os.environ["MONGODB_URI"] = self.mongo_uri
 
     def tearDown(self):
+        # Drop the test database after tests finish
+        client = motor.motor_asyncio.AsyncIOMotorClient(self.mongo_uri)
+        asyncio.run(client.drop_database(self.test_db_name))
         self.tmp.cleanup()
-        os.environ.pop("SERVICE_AGENT_DB", None)
+        os.environ.pop("MONGODB_DB", None)
+        os.environ.pop("MONGODB_URI", None)
 
     def test_signup_verify_login_logout_flow(self):
         async def run():
             with patch("src.auth.send_verification_email") as send_email:
-                result = await signup(SignupRequest(name="Test User", email=" Test@Example.COM ", password="secret1"))
+                result = await signup(
+                    SignupRequest(name="Test User", email=" Test@Example.COM ", password="secret1")
+                )
 
             self.assertNotIn("verification_token", result)
             send_email.assert_awaited_once()
 
-            user = await get_user_row("test@example.com")
+            user = await get_user_by_email("test@example.com")
             self.assertEqual(user["name"], "Test User")
             self.assertEqual(user["email"], "test@example.com")
             self.assertNotEqual(user["password_hash"], "secret1")
@@ -150,7 +112,7 @@ class AuthTests(unittest.TestCase):
         async def run():
             with patch("src.auth.send_verification_email"):
                 await signup(SignupRequest(name="Test User", email="test@example.com", password="oldpass"))
-            user = await get_user_row("test@example.com")
+            user = await get_user_by_email("test@example.com")
             await verify_email(user["verification_token"])
 
             with patch("src.auth.send_verification_or_reset_email") as send_email:
@@ -158,7 +120,7 @@ class AuthTests(unittest.TestCase):
 
             self.assertNotIn("reset_token", result)
             send_email.assert_awaited_once()
-            user = await get_user_row("test@example.com")
+            user = await get_user_by_email("test@example.com")
             self.assertTrue(user["reset_token"])
             self.assertTrue(user["reset_expires_at"])
 
@@ -181,32 +143,18 @@ class AuthTests(unittest.TestCase):
         async def run():
             with patch("src.auth.send_verification_email"):
                 await signup(SignupRequest(name="Test User", email="test@example.com", password="secret1"))
-            user = await get_user_row("test@example.com")
-            expired_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-            async with aiosqlite.connect(self.db_path) as conn:
-                await conn.execute(
-                    "UPDATE users SET verification_expires_at = ? WHERE email = ?",
-                    (expired_at, "test@example.com"),
-                )
-                await conn.commit()
+            user = await get_user_by_email("test@example.com")
+            expired_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            await db_module.db.users.update_one({"email": "test@example.com"}, {"$set": {"verification_expires_at": expired_at}})
 
             verify_error = await verify_email(user["verification_token"])
             self.assertEqual(verify_error.status_code, 400)
             self.assertIn(b"Verification Link Expired", verify_error.body)
 
-            async with aiosqlite.connect(self.db_path) as conn:
-                await conn.execute(
-                    """
-                    UPDATE users
-                    SET is_verified = 1,
-                        verification_token = NULL,
-                        reset_token = ?,
-                        reset_expires_at = ?
-                    WHERE email = ?
-                    """,
-                    ("expired-reset", expired_at, "test@example.com"),
-                )
-                await conn.commit()
+            await db_module.db.users.update_one(
+                {"email": "test@example.com"},
+                {"$set": {"is_verified": 1, "verification_token": None, "reset_token": "expired-reset", "reset_expires_at": expired_at}},
+            )
 
             with self.assertRaises(HTTPException) as reset_error:
                 await reset_password(ResetPasswordRequest(token="expired-reset", new_password="newpass1"))

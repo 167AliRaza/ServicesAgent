@@ -1,7 +1,5 @@
-import aiosqlite
-
 from src.agent_utils import add_log
-from src.config import get_db_path
+from src.db import get_active_providers
 
 def normalize_string(val: str) -> str:
     # Remove hyphens, spaces, and lowercase the string for highly robust comparisons
@@ -17,35 +15,25 @@ async def discover_providers(state: dict) -> dict:
 
     logs = add_log(state, f"DiscoveryAgent: Searching for '{service_type}' in '{location}'")
 
-    async with aiosqlite.connect(get_db_path()) as conn:
-        cursor = await conn.execute("""
-            SELECT id, name, service_type, location, rating, base_price
-            FROM providers
-            WHERE available = 1
-        """)
-        rows = await cursor.fetchall()
+    rows = await get_active_providers()
 
     norm_service = normalize_string(service_type)
     norm_location = normalize_string(location)
 
     exact_location_matches = []
     partial_location_matches = []
-    for r in rows:
-        db_service = normalize_string(r[2])
-        db_location = normalize_string(r[3])
+    for p in rows:
+        db_service = normalize_string(p["service_type"])
+        db_location = normalize_string(p["location"])
         service_matches = norm_service == db_service or norm_service in db_service or db_service in norm_service
         location_exact = norm_location == db_location
         location_partial = norm_location in db_location or db_location in norm_location
 
         if service_matches and (location_exact or location_partial):
-            provider = {
-                "id": r[0], "name": r[1], "service_type": r[2],
-                "location": r[3], "rating": r[4], "base_price": r[5]
-            }
             if location_exact:
-                exact_location_matches.append(provider)
+                exact_location_matches.append(p)
             else:
-                partial_location_matches.append(provider)
+                partial_location_matches.append(p)
 
     providers = exact_location_matches or partial_location_matches
     providers = sorted(providers, key=lambda p: (-float(p["rating"]), float(p["base_price"])))[:5]

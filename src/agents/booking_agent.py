@@ -1,8 +1,6 @@
 from pydantic import BaseModel, Field
-import aiosqlite
-
 from src.agent_utils import add_log, append_message, last_user_message
-from src.config import get_db_path
+from src.db import check_provider_availability, find_confirmed_booking, create_booking
 from src.llm import generate_json
 
 
@@ -247,53 +245,32 @@ async def simulate_booking(state: dict) -> dict:
     time_slot = parsed_intent.get("time", "ASAP")
     logs = [*logs, f"BookingAgent: Simulating booking for user '{user_id}' with {selected_provider['name']} at {time_slot}"]
 
-    async with aiosqlite.connect(get_db_path()) as conn:
-        cursor = await conn.execute(
-            "SELECT available FROM providers WHERE id = ?",
-            (selected_provider["id"],),
-        )
-        row = await cursor.fetchone()
-        if not row or not row[0]:
-            return {
-                "booking_status": "Pending: Provider unavailable",
-                "confirmation_status": "alternative_requested",
-                "provider_preference": "next_best",
-                "requested_provider_name": "",
-                "confirmation_prompt_override": f"{selected_provider['name']} is no longer available. I can show another provider or cancel.",
-                "logs": [*logs, "BookingAgent: Provider unavailable at booking time."],
-            }
+    provider_available = await check_provider_availability(selected_provider["id"])
+    if not provider_available:
+        return {
+            "booking_status": "Pending: Provider unavailable",
+            "confirmation_status": "alternative_requested",
+            "provider_preference": "next_best",
+            "requested_provider_name": "",
+            "confirmation_prompt_override": f"{selected_provider['name']} is no longer available. I can show another provider or cancel.",
+            "logs": [*logs, "BookingAgent: Provider unavailable at booking time."],
+        }
 
-        cursor = await conn.execute(
-            """
-            SELECT id FROM bookings
-            WHERE provider_id = ? AND user_id = ? AND booking_time = ? AND status = ?
-            ORDER BY id DESC LIMIT 1
-            """,
-            (selected_provider["id"], user_id, time_slot, "CONFIRMED"),
-        )
-        existing = await cursor.fetchone()
-        if existing:
-            status = f"Slot already booked for {time_slot} with {selected_provider['name']}. Confirmation sent."
-            return {
-                "booking_status": status,
-                "confirmation_status": "confirmed",
-                "provider_preference": "none",
-                "requested_provider_name": "",
-                "confirmation_prompt_override": "",
-                "booking_id": existing[0],
-                "messages": append_message(state, "assistant", status),
-                "logs": [*logs, "BookingAgent: Existing confirmed booking reused."],
-            }
+    existing = await find_confirmed_booking(selected_provider["id"], user_id, time_slot)
+    if existing:
+        status = f"Slot already booked for {time_slot} with {selected_provider['name']}. Confirmation sent."
+        return {
+            "booking_status": status,
+            "confirmation_status": "confirmed",
+            "provider_preference": "none",
+            "requested_provider_name": "",
+            "confirmation_prompt_override": "",
+            "booking_id": existing.get("id"),
+            "messages": append_message(state, "assistant", status),
+            "logs": [*logs, "BookingAgent: Existing confirmed booking reused."],
+        }
 
-        cursor = await conn.execute(
-            """
-            INSERT INTO bookings (provider_id, user_id, booking_time, status)
-            VALUES (?, ?, ?, ?)
-            """,
-            (selected_provider["id"], user_id, time_slot, "CONFIRMED"),
-        )
-        await conn.commit()
-        booking_id = cursor.lastrowid
+    booking_id = await create_booking(selected_provider["id"], user_id, time_slot, "CONFIRMED")
 
     status = f"Slot booked for {time_slot} with {selected_provider['name']}. Confirmation sent."
     return {

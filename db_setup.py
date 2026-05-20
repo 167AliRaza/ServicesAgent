@@ -1,108 +1,73 @@
-import sqlite3
+"""Initialize MongoDB collections, indexes, and default provider data."""
+from __future__ import annotations
 
-def setup_db():
-    conn = sqlite3.connect("service_agent.db")
-    cursor = conn.cursor()
+import os
 
-    # Create providers table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS providers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        service_type TEXT,
-        location TEXT,
-        rating REAL,
-        base_price REAL,
-        available BOOLEAN
-    )
-    """)
+import pymongo
+from dotenv import load_dotenv
 
-    # Create bookings table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS bookings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        provider_id INTEGER,
-        user_id TEXT,
-        booking_time TEXT,
-        status TEXT,
-        FOREIGN KEY (provider_id) REFERENCES providers (id)
-    )
-    """)
+load_dotenv()
 
-    # Create threads table (links thread_id to user + title)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS threads (
-        thread_id TEXT PRIMARY KEY,
-        user_id   TEXT NOT NULL,
-        title     TEXT NOT NULL DEFAULT 'New Conversation',
-        created_at TEXT NOT NULL
-    )
-    """)
 
-    # Create users table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL DEFAULT '',
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        is_verified INTEGER DEFAULT 0,
-        verification_token TEXT,
-        verification_expires_at TEXT,
-        reset_token TEXT,
-        reset_expires_at TEXT,
-        created_at TEXT NOT NULL
-    )
-    """)
+def get_mongodb_uri() -> str:
+    return os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 
-    cursor.execute("PRAGMA table_info(users)")
-    user_columns = {row[1] for row in cursor.fetchall()}
-    if "name" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''")
-    if "verification_expires_at" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN verification_expires_at TEXT")
-    if "reset_expires_at" not in user_columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN reset_expires_at TEXT")
 
-    # Create token_blacklist table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS token_blacklist (
-        token TEXT PRIMARY KEY,
-        expires_at TEXT NOT NULL
-    )
-    """)
+def get_mongodb_db() -> str:
+    return os.getenv("MONGODB_DB", "ServicesAgentDB")
 
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_verification_token ON users (verification_token)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_reset_token ON users (reset_token)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_token_blacklist_expires_at ON token_blacklist (expires_at)")
-    conn.commit()
 
-    # Check if providers are already populated
-    cursor.execute("SELECT COUNT(*) FROM providers")
-    count = cursor.fetchone()[0]
+PROVIDERS = [
+    {"id": 1, "name": "Ali AC Services", "service_type": "AC Technician", "location": "G-13", "rating": 4.8, "base_price": 1500.0, "available": True},
+    {"id": 2, "name": "Zain AC Repair", "service_type": "AC Technician", "location": "G-13", "rating": 4.2, "base_price": 1200.0, "available": True},
+    {"id": 3, "name": "Bilal Cooling", "service_type": "AC Technician", "location": "F-8", "rating": 4.6, "base_price": 1800.0, "available": True},
+    {"id": 4, "name": "Hassan Plumbers", "service_type": "Plumber", "location": "G-13", "rating": 4.5, "base_price": 1000.0, "available": True},
+    {"id": 5, "name": "Tariq Plumb Solutions", "service_type": "Plumber", "location": "G-10", "rating": 4.0, "base_price": 800.0, "available": True},
+    {"id": 6, "name": "Raza Electricians", "service_type": "Electrician", "location": "G-13", "rating": 4.7, "base_price": 1200.0, "available": True},
+]
 
-    if count == 0:
-        # Dummy data
-        providers_data = [
-            ("Ali AC Services", "AC Technician", "G-13", 4.8, 1500, True),
-            ("Zain AC Repair", "AC Technician", "G-13", 4.2, 1200, True),
-            ("Bilal Cooling", "AC Technician", "F-8", 4.6, 1800, True),
-            ("Hassan Plumbers", "Plumber", "G-13", 4.5, 1000, True),
-            ("Tariq Plumb Solutions", "Plumber", "G-10", 4.0, 800, True),
-            ("Raza Electricians", "Electrician", "G-13", 4.7, 1200, True)
-        ]
-        
-        cursor.executemany("""
-        INSERT INTO providers (name, service_type, location, rating, base_price, available)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, providers_data)
-        
-        conn.commit()
-        print("Database initialized and populated with dummy providers.")
+
+def setup_indexes(db) -> None:
+    db.users.create_index("email", unique=True)
+    db.users.create_index("verification_token")
+    db.users.create_index("reset_token")
+    try:
+        db.token_blacklist.drop_index("expires_at_1")
+    except Exception:
+        pass
+    db.token_blacklist.create_index("expires_at", expireAfterSeconds=0)
+    db.token_blacklist.create_index("token", unique=True)
+    db.threads.create_index("thread_id", unique=True)
+    db.threads.create_index([("user_id", 1), ("created_at", -1)])
+    db.providers.create_index("id", unique=True)
+    db.bookings.create_index("id", unique=True)
+    db.bookings.create_index([("provider_id", 1), ("user_id", 1), ("booking_time", 1), ("status", 1)])
+
+
+def setup_db() -> None:
+    mongo_uri = get_mongodb_uri()
+    mongo_db_name = get_mongodb_db()
+    client = pymongo.MongoClient(mongo_uri)
+    db = client[mongo_db_name]
+
+    setup_indexes(db)
+
+    if db.providers.count_documents({}) == 0:
+        db.providers.insert_many(PROVIDERS)
+        print("MongoDB providers collection populated with default providers.")
     else:
-        print("Database already populated.")
+        print("MongoDB providers collection already populated.")
 
-    conn.close()
+    max_booking = db.bookings.find_one(sort=[("id", -1)])
+    db.counters.update_one(
+        {"_id": "bookings"},
+        {"$max": {"seq": int(max_booking["id"]) if max_booking and max_booking.get("id") is not None else 0}},
+        upsert=True,
+    )
+
+    client.close()
+    print(f"MongoDB setup completed for database: {mongo_db_name}")
+
 
 if __name__ == "__main__":
     setup_db()

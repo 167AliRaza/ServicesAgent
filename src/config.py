@@ -4,12 +4,24 @@ from __future__ import annotations
 import os
 
 
-def get_db_path() -> str:
-    return os.getenv("SERVICE_AGENT_DB", "service_agent.db")
+def get_mongodb_uri() -> str:
+    return os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 
 
-def get_checkpoint_path() -> str:
-    return os.getenv("SERVICE_AGENT_CHECKPOINT_DB", "checkpoints.sqlite")
+def get_mongodb_db() -> str:
+    return os.getenv("MONGODB_DB", "ServicesAgentDB")
+
+
+def get_mongodb_checkpoint_db() -> str:
+    return os.getenv("MONGODB_CHECKPOINT_DB", get_mongodb_db())
+
+
+def get_mongodb_server_selection_timeout_ms() -> int:
+    try:
+        return int(os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000"))
+    except ValueError:
+        return 10000
+
 
 
 def get_gemini_model() -> str:

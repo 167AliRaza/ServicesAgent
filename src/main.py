@@ -3,21 +3,23 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 
-import aiosqlite
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import BaseModel
 
 from src.agent_utils import assistant_messages, message_content, message_role
 from src.agents.intent_agent import load_valid_services
 from src.auth import get_current_user, router as auth_router
-from src.config import get_checkpoint_path, get_db_path
+from src.config import get_mongodb_checkpoint_db, get_mongodb_uri, get_mongodb_db
 from src.db import (
+    close_mongodb,
+    init_mongodb,
     get_bookings,
     get_messages,
+    get_thread_owner,
     get_threads,
     migrate_database_schema,
     save_thread,
@@ -31,7 +33,6 @@ load_dotenv()
 
 graph = None
 checkpointer = None
-_db_conn = None
 
 
 async def create_thread(user_id: str, thread_id: str, first_message: str) -> None:
@@ -47,17 +48,21 @@ async def set_thread_title_from_message(thread_id: str, first_message: str) -> N
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global graph, checkpointer, _db_conn
+    global graph, checkpointer
+    init_mongodb(get_mongodb_uri(), get_mongodb_db())
     await migrate_database_schema()
     warnings = await validate_database()
     app.state.startup_warnings = warnings
     await load_valid_services()
-    _db_conn = await aiosqlite.connect(get_checkpoint_path(), check_same_thread=False)
-    checkpointer = AsyncSqliteSaver(_db_conn)
-    workflow = create_workflow()
-    graph = workflow.compile(checkpointer=checkpointer, interrupt_before=["simulate_booking"])
-    yield
-    await _db_conn.close()
+    with MongoDBSaver.from_conn_string(
+        get_mongodb_uri(),
+        db_name=get_mongodb_checkpoint_db(),
+    ) as mongo_checkpointer:
+        checkpointer = mongo_checkpointer
+        workflow = create_workflow()
+        graph = workflow.compile(checkpointer=checkpointer, interrupt_before=["simulate_booking"])
+        yield
+    close_mongodb()
 
 
 app = FastAPI(title="Agentic AI Service Request API", lifespan=lifespan)
@@ -145,11 +150,9 @@ async def request_endpoint(req: RequestBody, current_user: dict = Depends(get_cu
             raise HTTPException(status_code=404, detail="Thread not found")
 
         # Verify thread ownership
-        async with aiosqlite.connect(get_db_path()) as conn:
-            cur = await conn.execute("SELECT user_id FROM threads WHERE thread_id = ?", (thread_id,))
-            row = await cur.fetchone()
-            if not row or row[0] != user_id:
-                raise HTTPException(status_code=403, detail="Not authorized to access this thread")
+        thread_owner = await get_thread_owner(thread_id)
+        if thread_owner != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this thread")
 
         state_snap = await graph.aget_state(config)
         current_state = state_snap.values if state_snap else {}
@@ -238,13 +241,11 @@ async def list_user_threads(user_id: str, current_user: dict = Depends(get_curre
 async def get_thread_messages(thread_id: str, current_user: dict = Depends(get_current_user)):
     user_id = current_user["email"]
     # Verify thread ownership
-    async with aiosqlite.connect(get_db_path()) as conn:
-        cur = await conn.execute("SELECT user_id FROM threads WHERE thread_id = ?", (thread_id,))
-        row = await cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        if row[0] != user_id:
-            raise HTTPException(status_code=403, detail="Not authorized to access this thread")
+    thread_owner = await get_thread_owner(thread_id)
+    if thread_owner is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread_owner != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this thread")
 
     messages = await get_messages(thread_id, graph)
     return messages

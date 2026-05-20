@@ -1,10 +1,9 @@
-import aiosqlite
 import re
 
 from pydantic import BaseModel, Field
 
 from src.agent_utils import add_log, message_content, message_role
-from src.config import get_db_path
+from src.db import get_distinct_service_types
 from src.llm import generate_json
 
 # Module-level cache populated at app startup
@@ -24,10 +23,7 @@ class IntentOutput(BaseModel):
 async def load_valid_services():
     """Call once at startup to cache valid service types from DB."""
     global _valid_services
-    async with aiosqlite.connect(get_db_path()) as conn:
-        cursor = await conn.execute("SELECT DISTINCT service_type FROM providers")
-        rows = await cursor.fetchall()
-    _valid_services = [r[0] for r in rows]
+    _valid_services = await get_distinct_service_types()
 
 
 def _user_text(messages: list[dict]) -> str:
