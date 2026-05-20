@@ -1,0 +1,7 @@
+# Phase 6 Tasks
+
+- [x] Update `db_setup.py` — add `threads` table
+- [x] Create `src/db.py` — async DB helpers
+- [x] Create `src/agents/title_agent.py` — Gemini title generator
+- [x] Update `src/main.py` — SSE `/request`, 3 new read endpoints
+- [x] Verify server starts and all endpoints respond correctly

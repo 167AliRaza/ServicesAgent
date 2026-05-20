@@ -1,0 +1,58 @@
+# Agentic AI Service Request System: Final Implementation Plan
+
+This document outlines the architecture, tech stack, and step-by-step plan to build an MVP of the Agentic AI System that automates the lifecycle of service requests.
+
+## Goal Description
+Build an end-to-end Agentic AI workflow that understands natural language service requests (in Urdu, Roman Urdu, and English), discovers and ranks relevant providers, simulates the booking process, and schedules follow-up actions. The system will clearly expose its reasoning and execution trace at each step.
+
+> [!NOTE]
+> We will use an agentic state-machine approach. This ensures that the reasoning pipeline (planning → decision → action → follow-up) is strictly followed, and all tool usage and decisions are easily traceable and loggable.
+
+## Proposed Architecture & Tech Stack
+
+- **Language:** Python
+- **Package Manager:** **uv**
+- **Agent Framework:** **LangGraph** (Ideal for building structured, stateful, multi-agent workflows with clear observability and branching logic).
+- **LLM:** **google-generativeai** (Direct SDK for Gemini 1.5 Pro / Flash).
+- **Interface:** **FastAPI** (Exposes the agent workflow via REST APIs).
+- **Data Layer:** **SQLite** (for the mock provider database and booking registry).
+
+### Workflow Pipeline (LangGraph Nodes)
+The system will maintain a shared "State" (e.g., `user_input`, `parsed_intent`, `discovered_providers`, `selected_provider`, `booking_details`, `followup_plan`, `execution_logs`).
+
+1. **Intent Extraction Agent:** 
+   - Takes raw user text via FastAPI.
+   - Uses `google-generativeai` Structured Outputs to extract `service_type` (e.g., "AC Technician"), `location` (e.g., "G-13"), and `time` (e.g., "Tomorrow morning").
+2. **Provider Discovery Agent:**
+   - Queries the SQLite database to find providers matching the `service_type` and `location`.
+3. **Matching & Ranking Agent:**
+   - Evaluates providers based on distance, rating, and availability.
+   - Selects the best match and generates a natural language explanation (reasoning) for the choice.
+4. **Action Simulator Agent:**
+   - Creates a booking record in the SQLite database.
+   - Generates a simulated confirmation receipt/message.
+5. **Follow-Up Agent:**
+   - Drafts reminder messages and schedules them.
+
+## Proposed Changes
+
+### Phase 1: Environment & Mock Data
+- Initialize project with `uv init`.
+- Install dependencies: `uv add langgraph google-generativeai pydantic fastapi uvicorn sqlite3`
+- Create `db_setup.py` to initialize SQLite and seed it with dummy providers.
+
+### Phase 2: Core Agents Implementation
+- **`src/agents/intent_agent.py`**: Prompt engineering to parse English, Urdu, and Roman Urdu.
+- **`src/agents/discovery_agent.py`**: SQLite queries to filter providers.
+- **`src/agents/ranking_agent.py`**: LLM + Python logic to rank and generate reasoning.
+- **`src/agents/booking_agent.py`**: Simulates database writes.
+- **`src/agents/followup_agent.py`**: Generates post-booking scheduling logic.
+
+### Phase 3: Workflow Orchestration & Interface
+- **`src/workflow.py`**: Assemble the LangGraph pipeline, connecting nodes and defining state transitions.
+- **`src/main.py`**: FastAPI application exposing endpoints like `POST /api/v1/request-service` which runs the graph and returns the full trace.
+
+## Verification Plan
+- Run `uvicorn src.main:app --reload`.
+- Use `curl` or Swagger UI to send a request: `{"text": "Mujhe kal subah G-13 mein AC technician chahiye"}`.
+- Verify the API response contains the intent, selected provider, reasoning, and simulated booking.

@@ -1,0 +1,70 @@
+# Refactor Endpoints and Agent Output Strategies
+
+This plan addresses the three requested changes to the Agentic Service Request System:
+1. Merging the `reply` endpoint into the `request` endpoint.
+2. Utilizing Pydantic `BaseModel` for structured output from Gemini in `intent_agent` and `ranking_agent`.
+3. Replacing the static rejection checking in `booking_agent` with an AI-driven check using Gemini.
+
+## User Review Required
+> [!IMPORTANT]
+> The `reply` endpoint will be removed and its functionality will be absorbed by the `request` endpoint. Clients that previously used `POST /reply/{task_id}` will now need to use `POST /request` with `{"thread_id": "..."}` included in the body. Please confirm this breaking change for API consumers is acceptable.
+
+## Open Questions
+> [!NOTE]
+> - Is there a specific model version of Gemini you prefer for the boolean rejection check in `booking_agent.py`? (Assuming `gemini-2.5-flash-lite` to match the others).
+
+## Proposed Changes
+
+### main.py
+Update the API endpoints in `src/main.py`.
+
+#### [MODIFY] [main.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/main.py)
+- Modify the `RequestBody` Pydantic model to include an optional `thread_id: str | None = None`.
+- Modify `request_endpoint` to:
+  - Check if `req.thread_id` is provided. If so, fetch the existing state and append the new user message.
+  - If `req.thread_id` is not provided, generate a new UUID and set up the initial state.
+- **Remove** the `reply_endpoint` completely, as its logic is now merged.
+
+---
+
+### Intent Agent
+Update the parsing strategy to enforce structured output.
+
+#### [MODIFY] [intent_agent.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/agents/intent_agent.py)
+- Import `BaseModel` from `pydantic`.
+- Create a `class IntentOutput(BaseModel):` with fields `service_type`, `location`, and `time`.
+- Modify `client.models.generate_content` call to use `response_schema=IntentOutput` in the `GenerateContentConfig`.
+- Remove the manual `json.loads` block, and directly access properties of the returned parsed object.
+
+---
+
+### Ranking Agent
+Update the ranking strategy to enforce structured output.
+
+#### [MODIFY] [ranking_agent.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/agents/ranking_agent.py)
+- Import `BaseModel` from `pydantic`.
+- Create a `class RankingOutput(BaseModel):` with fields `selected_id: int` and `reasoning: str`.
+- Modify the prompt and `client.models.generate_content` call to use `response_schema=RankingOutput`.
+- Replace manual string parsing (e.g., splitting by "ID:") with direct object access.
+
+---
+
+### Booking Agent
+Replace static substring matching with an LLM call to detect rejections.
+
+#### [MODIFY] [booking_agent.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/agents/booking_agent.py)
+- Import `google.genai` and `BaseModel`.
+- Create a `class RejectionOutput(BaseModel):` with a boolean field `is_rejection`.
+- Instead of using a static `rejection_words` set, send the last user message to Gemini using structured output to determine if it expresses a clear refusal or cancellation.
+- If the model returns `is_rejection = True`, abort the booking simulation as before.
+
+## Verification Plan
+
+### Automated Tests
+- N/A - No tests are currently specified in the codebase context.
+
+### Manual Verification
+1. Send a request to `/request` without a `thread_id` and ensure a new thread is created and intent is parsed correctly via the new structured output.
+2. Send a subsequent request to `/request` *with* the `thread_id` to ensure the conversational history is correctly resumed (verifying the merged endpoint).
+3. Test a discovery flow where multiple providers are found and verify `ranking_agent` returns a well-formed selection.
+4. During the booking confirmation step, type a complex rejection (e.g., "I don't think I want to proceed right now") to ensure the LLM-powered `booking_agent` successfully intercepts it and cancels the booking.

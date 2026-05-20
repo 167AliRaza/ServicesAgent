@@ -1,0 +1,159 @@
+# Phase 6: Thread History, SSE Streaming, and Bookings Listing
+
+## Background
+
+The app currently has a single `POST /request` endpoint that runs the LangGraph workflow synchronously and returns the result as JSON. There is no persistent record of which threads belong to which user, no way to retrieve conversation message history, and no way to list a user's past bookings.
+
+This plan adds four new capabilities:
+1. **Thread listing** — `GET /threads/{user_id}` returns all threads with IDs and titles.
+2. **Thread message history** — `GET /threads/{thread_id}/messages` returns a formatted conversation.
+3. **SSE streaming for `/request`** — streams agent events in real-time instead of blocking.
+4. **User bookings listing** — `GET /bookings/{user_id}` returns past bookings with provider name and status.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Thread Title Generation:** The plan generates a thread title by asking Gemini to summarize the first user message into a short (≤ 5 words) service request title (e.g., "AC Repair in G-13"). This adds one small Gemini call per new thread. If you prefer a simpler rule-based title (e.g., using the first 60 characters of the first message), we can do that instead with zero extra latency.
+
+> [!IMPORTANT]
+> **SSE vs HTTP polling:** Moving `/request` to SSE means the client must consume a stream instead of a single JSON response. The response will be a series of `data: {...}` events ending with a `data: {"type": "done", ...}` event that carries the final state and `task_id`. Confirm this is acceptable for the mobile client (Expo's `fetch` can handle SSE via `EventSource` or a streaming fetch).
+
+> [!NOTE]
+> **`checkpoints.sqlite` vs `service_agent.db`:** Thread metadata (`threads` table) will be stored in `service_agent.db` alongside `providers` and `bookings` to keep all app data in one file. LangGraph conversation state stays in `checkpoints.sqlite`.
+
+---
+
+## Open Questions
+
+> [!NOTE]
+> - Should message history return **all** roles (user + assistant + system) or just `user` and `assistant`?  
+>   Assuming user + assistant only, formatted cleanly.
+> - Should the `/bookings/{user_id}` response include the **provider details** (name, service_type) joined from the `providers` table? The plan does this since raw `provider_id` is not useful to a mobile app.
+
+---
+
+## Proposed Changes
+
+### 1. Database — New `threads` table
+
+#### [MODIFY] [db_setup.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/db_setup.py)
+
+Add a `threads` table that links `thread_id → user_id + title + created_at`.
+
+```sql
+CREATE TABLE IF NOT EXISTS threads (
+    thread_id TEXT PRIMARY KEY,
+    user_id   TEXT NOT NULL,
+    title     TEXT NOT NULL DEFAULT 'New Conversation',
+    created_at TEXT NOT NULL
+)
+```
+
+The `setup_db()` function needs to be callable again without dropping existing data (the table uses `CREATE TABLE IF NOT EXISTS` so it is safe to re-run).
+
+> [!NOTE]
+> Since `db_setup.py` uses the synchronous `sqlite3` driver and is run once at startup, we add the new table there. All runtime reads/writes will use `aiosqlite` as already used elsewhere.
+
+---
+
+### 2. New helper module — `src/db.py`
+
+#### [NEW] [db.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/db.py)
+
+A thin async helper for app-level DB queries (not the LangGraph checkpointer):
+
+| Function | Purpose |
+|---|---|
+| `save_thread(thread_id, user_id, title)` | Inserts a new row into `threads` |
+| `get_threads(user_id)` | Returns `[{thread_id, title, created_at}]` for a user |
+| `get_messages(thread_id, graph)` | Reads `messages` from LangGraph checkpoint state for a thread |
+| `get_bookings(user_id)` | Returns bookings joined with provider name and service_type |
+
+---
+
+### 3. Title generation helper — `src/agents/title_agent.py`
+
+#### [NEW] [title_agent.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/agents/title_agent.py)
+
+Single async function `generate_title(first_user_message: str) -> str` that calls `gemini-2.5-flash-lite` with a short prompt to produce a ≤ 5-word title summarizing the service request. Falls back to truncating the message to 40 chars if the Gemini call fails.
+
+---
+
+### 4. SSE streaming for `POST /request`
+
+#### [MODIFY] [main.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/main.py)
+
+- Add `from fastapi.responses import StreamingResponse`.
+- Change the `request_endpoint` return type to a `StreamingResponse` with `media_type="text/event-stream"`.
+- The inner async generator will:
+  1. Determine new vs. existing thread.
+  2. On **new** threads: call `generate_title()`, then `save_thread()` to `service_agent.db`.
+  3. Use `graph.astream_events(state, config, version="v2")` to stream events.
+  4. Yield `data: {"type": "agent_event", "agent": ..., "message": ...}\n\n` for each `on_chain_end` / `on_tool_end` event that carries a log update.
+  5. After the stream ends, yield a final `data: {"type": "done", "task_id": ..., "status": ..., "assistant_message": ...}\n\n`.
+
+> [!NOTE]
+> `graph.astream_events` is available in LangGraph ≥ 0.2. The project already has `langgraph>=1.2.0` so this is safe.
+
+---
+
+### 5. New endpoints in `main.py`
+
+#### [MODIFY] [main.py](file:///c:/Users/User-1/Music/informalServicesMPAgent/src/main.py)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/threads/{user_id}` | Returns `[{thread_id, title, created_at}]` for the user |
+| `GET` | `/threads/{thread_id}/messages` | Returns formatted `[{role, content}]` list for the thread |
+| `GET` | `/bookings/{user_id}` | Returns `[{id, provider_name, service_type, booking_time, status}]` |
+
+All three are simple async read endpoints — no graph invocation needed, just DB queries via `src/db.py`.
+
+---
+
+## Verification Plan
+
+### Manual / curl tests
+
+1. **New thread via SSE:**
+   ```powershell
+   # Using curl to consume SSE stream
+   curl -N -X POST http://127.0.0.1:8000/request `
+     -H "Content-Type: application/json" `
+     -d '{"text": "AC repair in G-13 please", "user_id": "user_1"}'
+   ```
+   Expect a stream of `data:` lines ending with `{"type":"done", "task_id":"<uuid>", ...}`.
+
+2. **List threads:**
+   ```powershell
+   curl http://127.0.0.1:8000/threads/user_1
+   ```
+   Expect `[{"thread_id":"...","title":"AC Repair in G-13","created_at":"..."}]`.
+
+3. **Message history:**
+   ```powershell
+   curl http://127.0.0.1:8000/threads/<thread_id>/messages
+   ```
+   Expect `[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]`.
+
+4. **Continue conversation (existing thread):**
+   ```powershell
+   curl -N -X POST http://127.0.0.1:8000/request `
+     -H "Content-Type: application/json" `
+     -d '{"text": "Yes confirm the booking", "thread_id": "<uuid>"}'
+   ```
+   Expect a stream ending with `{"type":"done","status":"completed", ...}`.
+
+5. **User bookings:**
+   ```powershell
+   curl http://127.0.0.1:8000/bookings/user_1
+   ```
+   Expect `[{"id":1,"provider_name":"Ali AC Services","service_type":"AC Technician","booking_time":"ASAP","status":"CONFIRMED"}]`.
+
+### Server start validation
+```powershell
+uv run uvicorn src.main:app --reload
+```
+No startup errors; Swagger at `http://127.0.0.1:8000/docs` shows five endpoints: `/request`, `/ws/{task_id}`, `/threads/{user_id}`, `/threads/{thread_id}/messages`, `/bookings/{user_id}`.

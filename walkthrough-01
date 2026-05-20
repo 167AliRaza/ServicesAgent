@@ -1,0 +1,72 @@
+# Walkthrough: API Refactoring & Structured AI Output Upgrades
+
+I have successfully completed Phase 5 of the Agentic Service Request System, integrating robust structured outputs with the Gemini 2.x SDK and merging the endpoints for a much more cohesive user flow.
+
+## 🌟 Key Accomplishments
+
+### 1. Merged Endpoints (`POST /request`)
+The previous two-endpoint model (`POST /request` and `POST /reply/{task_id}`) has been consolidated into a single unified `/request` endpoint in `src/main.py`.
+- **Merged Endpoint:** `POST /request`
+- **Payload:** Accepts `RequestBody` with an optional `thread_id`.
+  - **Without `thread_id`:** Generates a new task/thread UUID and triggers the start of a fresh workflow run.
+  - **With `thread_id`:** Checks the SQLite checkpointer state for the existing conversation, appends the new message, and resumes the workflow smoothly from where it left off.
+- **Removed Endpoint:** `POST /reply/{task_id}` has been safely deleted.
+
+### 2. Structured Outputs with Pydantic (`IntentAgent` & `RankingAgent`)
+Instead of relying strictly on free-text prompting and complex regular expressions, we now utilize the Gemini 2.x native `response_schema` parameter to return guaranteed Pydantic structures.
+- **Intent Extraction (`src/agents/intent_agent.py`):** Enforces a `IntentOutput` schema containing:
+  - `service_type` (strict canonical categorization matching database rows)
+  - `location`
+  - `time` (defaulting to `"ASAP"`)
+- **Matching & Ranking (`src/agents/ranking_agent.py`):** Enforces a `RankingOutput` schema returning:
+  - `selected_id` (integer)
+  - `reasoning` (brief 1-sentence selection reasoning)
+
+### 3. LLM-Driven Rejection Check (`BookingAgent`)
+Removed fragile and language-specific static string checks (like matching `no`, `nahi`, `nope`) from the `BookingAgent`.
+- The agent now calls Gemini using `gemini-2.5-flash-lite` and a structured `RejectionCheckOutput` Pydantic model (`is_rejection: bool`).
+- Can robustly identify cancellations and booking refusals regardless of complex phrasing, typos, Roman Urdu, Urdu script, or context (e.g., "I don't think I want to proceed right now").
+
+---
+
+## 🧪 Verification Results
+
+All new changes have been validated end-to-end using a custom test runner script. Below is the output of the test run showing 100% test completion:
+
+```
+Testing Intent Agent...
+Intent output: {'service_type': 'AC Technician', 'location': 'G-13', 'time': 'Tomorrow morning at 10 AM'}
+Intent Agent OK!
+
+Testing Ranking Agent...
+Ranking output: {'id': 1, 'name': 'Ali AC Services', 'service_type': 'AC Technician', 'location': 'G-13', 'rating': 4.8, 'base_price': 1500, 'available': True}
+Reasoning: Ali AC Services was chosen due to its higher rating of 4.8 compared to Zain AC Repair's 4.2, while still offering a competitive base price.
+Ranking Agent OK!
+
+Testing Booking Agent Rejection...
+Booking rejection output status: Failed: Cancelled by user
+Booking Agent Rejection OK!
+
+Testing Booking Agent Acceptance...
+Booking acceptance output status: Slot booked for 10:00 AM with Ali AC Services. Confirmation sent.
+Booking Agent Acceptance OK!
+```
+
+---
+
+## 🛠️ Verification Commands
+
+You can run the FastAPI server to test the consolidated endpoint directly:
+```powershell
+uv run uvicorn src.main:app --reload
+```
+
+Send a request without a `thread_id` to start a thread:
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/request" -ContentType "application/json" -Body '{"text": "Mujhe AC repairing chahiye G-13 mein"}'
+```
+
+And continue the same conversation by supplying the returned `task_id` in the next request body:
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/request" -ContentType "application/json" -Body '{"text": "Yes please, confirm booking", "thread_id": "YOUR_TASK_ID_HERE"}'
+```

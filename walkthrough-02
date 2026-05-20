@@ -1,0 +1,90 @@
+# Walkthrough: Unified Real-Time SSE Log Streaming & Thread Management
+
+We have successfully migrated the request handling architecture from a separate WebSocket protocol to a **unified, modern Server-Sent Events (SSE) stream** on the `/request` endpoint!
+
+---
+
+## 🌟 Modern SSE Stream Design
+
+The endpoint `POST /request` now handles the entire workflow of executing agents and logging inside a **single HTTP connection** using LangGraph's async updates stream (`graph.astream`):
+
+```mermaid
+sequenceDiagram
+    participant App as Android Chat UI (Client)
+    participant API as FastAPI Backend (Server)
+    participant LangGraph as LangGraph Agent Workflow
+
+    App->>API: POST /request (User message)
+    activate API
+    API->>LangGraph: astream(input_state)
+    
+    loop Real-time Agent Updates
+        LangGraph-->>API: yield updates
+        API-->>App: data: {"type": "agent_start", "agent": "...", "message": "..."}
+        API-->>App: data: {"type": "log", "agent": "...", "message": "..."}
+    end
+
+    LangGraph-->>API: returns final state (or Interrupted)
+    API-->>App: data: {"type": "done", "task_id": "...", "status": "...", "assistant_message": "..."}
+    deactivate API
+    Note over App,API: SSE Connection Closes
+```
+
+### Event Payload Formats
+
+As the connection remains open, the mobile client receives three highly structured event types:
+
+1. **`agent_start` Event:** Indicates which agent (e.g. `IntentAgent`, `DiscoveryAgent`, `RankingAgent`) is currently executing.
+   ```json
+   {
+     "type": "agent_start",
+     "agent": "IntentAgent",
+     "message": "IntentAgent is running..."
+   }
+   ```
+2. **`log` Event:** Real-time log entries printed by the active agent.
+   ```json
+   {
+     "type": "log",
+     "agent": "DiscoveryAgent",
+     "message": "Searching for 'AC Technician' in 'G-13'"
+   }
+   ```
+3. **`done` Event:** Fired at the end of the step. Carries the final answer or clarification request, status, and full state dump.
+   ```json
+   {
+     "type": "done",
+     "task_id": "8b9e6f30-84c4-42b7-a36c-2f96cfb2fb2b",
+     "status": "awaiting_confirmation",
+     "assistant_message": "I found Ali AC Services for 1500.0 PKR. Do you want me to book this for you? (Yes/No)",
+     "full_state": { ... }
+   }
+   ```
+
+---
+
+## 🛠️ Verification & API usage
+
+### 1. Send Request & Monitor real-time logs:
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/request" -ContentType "application/json" -Body '{"text": "AC repair in G-13 tomorrow at 10 AM", "user_id": "test_user_1"}'
+```
+*Client streams the initial parsing logs and finishes with the selection done payload.*
+
+### 2. Retrieve threads listing:
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/threads/test_user_1"
+```
+*Returns `[{"thread_id": "...", "title": "AC repair in G-13", "created_at": "..."}]`*
+
+### 3. Get message history for the thread:
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/threads/YOUR_THREAD_ID/messages"
+```
+*Returns clean array of message turns suitable for mobile UI rendering.*
+
+### 4. Retrieve bookings listing:
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/bookings/test_user_1"
+```
+*Returns full confirmation statuses joined with real provider information.*
