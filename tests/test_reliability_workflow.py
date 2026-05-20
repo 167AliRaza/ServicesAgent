@@ -61,6 +61,8 @@ class MockModels:
             return MockResponse('{"service_type": "", "location": "", "time": "ASAP"}')
         if "plumber" in text:
             return MockResponse('{"service_type": "Plumber", "location": "G-13", "time": "ASAP"}')
+        if "technition" in text:
+            return MockResponse('{"service_type": "AC Technician", "location": "", "time": "ASAP"}')
         if "ac repair" in text or "ac technician" in text:
             if "g-13" in text:
                 return MockResponse('{"service_type": "AC Technician", "location": "G-13", "time": "tomorrow 10 AM"}')
@@ -145,6 +147,26 @@ class ReliabilityWorkflowTests(unittest.TestCase):
         }
         result = parse_intent(state)
         self.assertEqual(result["parsed_intent"]["service_type"], "Milk")
+        self.assertEqual(result["parsed_intent"]["location"], "G-13")
+
+    @patch("google.genai.Client", MockGenaiClient)
+    def test_intent_extracts_city_location_from_latest_user_message(self):
+        state = {
+            "messages": [{"role": "user", "content": "ac technition in lahore"}],
+            "logs": [],
+        }
+        result = parse_intent(state)
+        self.assertEqual(result["parsed_intent"]["service_type"], "AC Technician")
+        self.assertEqual(result["parsed_intent"]["location"], "Lahore")
+
+    @patch("google.genai.Client", MockGenaiClient)
+    def test_intent_keeps_sector_location_format(self):
+        state = {
+            "messages": [{"role": "user", "content": "Need AC repair in g13"}],
+            "logs": [],
+        }
+        result = parse_intent(state)
+        self.assertEqual(result["parsed_intent"]["service_type"], "AC Technician")
         self.assertEqual(result["parsed_intent"]["location"], "G-13")
 
     @patch("google.genai.Client", MockGenaiClient)

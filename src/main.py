@@ -2,9 +2,10 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.checkpoint.mongodb import MongoDBSaver
@@ -16,6 +17,9 @@ from src.auth import get_current_user, router as auth_router
 from src.config import get_mongodb_checkpoint_db, get_mongodb_uri, get_mongodb_db
 from src.db import (
     close_mongodb,
+    list_due_followups,
+    mark_followup_failed,
+    mark_followup_sent,
     init_mongodb,
     get_bookings,
     get_messages,
@@ -27,6 +31,7 @@ from src.db import (
     update_thread_title,
     validate_database,
 )
+from src.config import get_cron_secret
 from src.workflow import create_workflow
 
 load_dotenv()
@@ -78,6 +83,32 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 
 
+def _followup_message(task: dict) -> str:
+    booking_id = task.get("booking_id")
+    task_type = task.get("type")
+    if task_type == "pre_service_reminder":
+        return f"Reminder: your booking #{booking_id} is coming up soon."
+    if task_type == "post_service_checkin":
+        return f"Check-in: how was your booking #{booking_id} experience?"
+    return f"Follow-up update for booking #{booking_id}."
+
+
+async def _process_due_followups() -> dict:
+    tasks = await list_due_followups(limit=200)
+    sent = 0
+    failed = 0
+    for task in tasks:
+        try:
+            # v1 delivery channel is in-app only; we mark as sent after generating message payload.
+            _ = _followup_message(task)
+            await mark_followup_sent(task["_id"])
+            sent += 1
+        except Exception as error:
+            await mark_followup_failed(task["_id"], str(error))
+            failed += 1
+    return {"due": len(tasks), "sent": sent, "failed": failed, "processed_at": datetime.now(timezone.utc).isoformat()}
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     return JSONResponse(
@@ -88,7 +119,6 @@ async def global_exception_handler(request, exc):
 
 class RequestBody(BaseModel):
     text: str
-    user_id: str = "anonymous"
     thread_id: str | None = None
 
 
@@ -256,3 +286,13 @@ async def list_user_bookings(user_id: str, current_user: dict = Depends(get_curr
     if user_id != current_user["email"]:
         raise HTTPException(status_code=403, detail="Not authorized to access bookings for this user")
     return await get_bookings(user_id)
+
+
+@app.post("/cron/process-followups")
+async def process_followups(x_cron_secret: str | None = Header(default=None)):
+    secret = get_cron_secret()
+    if not secret:
+        raise HTTPException(status_code=503, detail="CRON_SECRET is not configured")
+    if x_cron_secret != secret:
+        raise HTTPException(status_code=403, detail="Invalid cron secret")
+    return await _process_due_followups()

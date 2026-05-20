@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
 import motor.motor_asyncio
+from bson import ObjectId
 
 from pymongo import ReturnDocument
 
@@ -92,8 +93,11 @@ async def create_mongodb_indexes() -> None:
     await database.threads.create_index("thread_id", unique=True)
     await database.threads.create_index([("user_id", 1), ("created_at", -1)])
     await database.providers.create_index("id", unique=True)
+    await database.providers.create_index([("lat", 1), ("lng", 1)])
     await database.bookings.create_index("id", unique=True)
     await database.bookings.create_index([("provider_id", 1), ("user_id", 1), ("booking_time", 1), ("status", 1)])
+    await database.followups.create_index([("status", 1), ("scheduled_for", 1)])
+    await database.followups.create_index([("booking_id", 1), ("type", 1)], unique=True)
 
 
 async def migrate_database_schema() -> None:
@@ -390,7 +394,9 @@ async def get_active_providers() -> list[dict]:
             "service_type": doc["service_type"],
             "location": doc["location"],
             "rating": doc["rating"],
-            "base_price": doc["base_price"]
+            "base_price": doc["base_price"],
+            "lat": doc.get("lat"),
+            "lng": doc.get("lng"),
         })
     return results
 
@@ -400,3 +406,75 @@ async def get_distinct_service_types() -> list[str]:
     database = _require_db()
     types = await database.providers.distinct("service_type")
     return [str(t) for t in types]
+
+
+async def create_followup_tasks(tasks: list[dict]) -> int:
+    """Upsert follow-up tasks and return how many were created/updated."""
+    if not tasks:
+        return 0
+    database = _require_db()
+    created = 0
+    now = _utc_now()
+    for task in tasks:
+        result = await database.followups.update_one(
+            {
+                "booking_id": task["booking_id"],
+                "type": task["type"],
+            },
+            {
+                "$set": {
+                    "user_id": task["user_id"],
+                    "provider_id": task.get("provider_id"),
+                    "channel": task.get("channel", "in_app"),
+                    "scheduled_for": task["scheduled_for"],
+                    "status": "pending",
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "attempts": 0,
+                    "last_error": None,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+        if result.upserted_id is not None or result.modified_count > 0:
+            created += 1
+    return created
+
+
+async def list_due_followups(limit: int = 100) -> list[dict]:
+    """Return due pending follow-ups ordered by schedule time."""
+    database = _require_db()
+    cursor = (
+        database.followups
+        .find({"status": "pending", "scheduled_for": {"$lte": _utc_now()}})
+        .sort("scheduled_for", 1)
+        .limit(limit)
+    )
+    docs = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        docs.append(doc)
+    return docs
+
+
+async def mark_followup_sent(followup_id: str) -> None:
+    """Mark follow-up as sent."""
+    database = _require_db()
+    await database.followups.update_one(
+        {"_id": ObjectId(followup_id)},
+        {"$set": {"status": "sent", "sent_at": _utc_now(), "updated_at": _utc_now()}},
+    )
+
+
+async def mark_followup_failed(followup_id: str, error: str) -> None:
+    """Mark follow-up as failed and bump attempts."""
+    database = _require_db()
+    await database.followups.update_one(
+        {"_id": ObjectId(followup_id)},
+        {
+            "$set": {"status": "failed", "last_error": error, "updated_at": _utc_now()},
+            "$inc": {"attempts": 1},
+        },
+    )

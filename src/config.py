@@ -23,6 +23,10 @@ def get_mongodb_server_selection_timeout_ms() -> int:
         return 10000
 
 
+def get_cron_secret() -> str | None:
+    return os.getenv("CRON_SECRET")
+
+
 
 def get_gemini_model() -> str:
     return os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")

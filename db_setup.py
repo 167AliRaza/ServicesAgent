@@ -18,12 +18,12 @@ def get_mongodb_db() -> str:
 
 
 PROVIDERS = [
-    {"id": 1, "name": "Ali AC Services", "service_type": "AC Technician", "location": "G-13", "rating": 4.8, "base_price": 1500.0, "available": True},
-    {"id": 2, "name": "Zain AC Repair", "service_type": "AC Technician", "location": "G-13", "rating": 4.2, "base_price": 1200.0, "available": True},
-    {"id": 3, "name": "Bilal Cooling", "service_type": "AC Technician", "location": "F-8", "rating": 4.6, "base_price": 1800.0, "available": True},
-    {"id": 4, "name": "Hassan Plumbers", "service_type": "Plumber", "location": "G-13", "rating": 4.5, "base_price": 1000.0, "available": True},
-    {"id": 5, "name": "Tariq Plumb Solutions", "service_type": "Plumber", "location": "G-10", "rating": 4.0, "base_price": 800.0, "available": True},
-    {"id": 6, "name": "Raza Electricians", "service_type": "Electrician", "location": "G-13", "rating": 4.7, "base_price": 1200.0, "available": True},
+    {"id": 1, "name": "Ali AC Services", "service_type": "AC Technician", "location": "G-13", "lat": 33.6469, "lng": 72.9616, "rating": 4.8, "base_price": 1500.0, "available": True},
+    {"id": 2, "name": "Zain AC Repair", "service_type": "AC Technician", "location": "G-13", "lat": 33.6469, "lng": 72.9616, "rating": 4.2, "base_price": 1200.0, "available": True},
+    {"id": 3, "name": "Bilal Cooling", "service_type": "AC Technician", "location": "F-8", "lat": 33.7104, "lng": 73.0395, "rating": 4.6, "base_price": 1800.0, "available": True},
+    {"id": 4, "name": "Hassan Plumbers", "service_type": "Plumber", "location": "G-13", "lat": 33.6469, "lng": 72.9616, "rating": 4.5, "base_price": 1000.0, "available": True},
+    {"id": 5, "name": "Tariq Plumb Solutions", "service_type": "Plumber", "location": "G-10", "lat": 33.6762, "lng": 73.0149, "rating": 4.0, "base_price": 800.0, "available": True},
+    {"id": 6, "name": "Raza Electricians", "service_type": "Electrician", "location": "G-13", "lat": 33.6469, "lng": 72.9616, "rating": 4.7, "base_price": 1200.0, "available": True},
 ]
 
 
@@ -40,8 +40,11 @@ def setup_indexes(db) -> None:
     db.threads.create_index("thread_id", unique=True)
     db.threads.create_index([("user_id", 1), ("created_at", -1)])
     db.providers.create_index("id", unique=True)
+    db.providers.create_index([("lat", 1), ("lng", 1)])
     db.bookings.create_index("id", unique=True)
     db.bookings.create_index([("provider_id", 1), ("user_id", 1), ("booking_time", 1), ("status", 1)])
+    db.followups.create_index([("status", 1), ("scheduled_for", 1)])
+    db.followups.create_index([("booking_id", 1), ("type", 1)], unique=True)
 
 
 def setup_db() -> None:
@@ -56,6 +59,11 @@ def setup_db() -> None:
         db.providers.insert_many(PROVIDERS)
         print("MongoDB providers collection populated with default providers.")
     else:
+        for provider in PROVIDERS:
+            db.providers.update_one(
+                {"id": provider["id"]},
+                {"$set": {"lat": provider["lat"], "lng": provider["lng"]}},
+            )
         print("MongoDB providers collection already populated.")
 
     max_booking = db.bookings.find_one(sort=[("id", -1)])
